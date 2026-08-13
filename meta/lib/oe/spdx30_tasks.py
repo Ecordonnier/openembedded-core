@@ -1246,8 +1246,226 @@ def create_image_spdx(d):
     oe.sbom30.write_recipe_jsonld_doc(d, objset, "image", spdx_work_dir)
 
 
+def packages_licenses_element_filter(obj):
+    """
+    Keep install packages, licenses, and license/runtime-dep relationships.
+    Drop files, build graphs, VEX, and source/download packages.
+    """
+    import oe.spdx30
+
+    if isinstance(obj, oe.spdx30.software_File):
+        return False
+
+    if isinstance(obj, oe.spdx30.build_Build):
+        return False
+
+    if isinstance(obj, oe.spdx30.LifecycleScopedRelationship):
+        return False
+
+    if isinstance(obj, oe.spdx30.Relationship):
+        if obj.relationshipType == oe.spdx30.RelationshipType.dependsOn:
+            return True
+        if obj.relationshipType not in (
+            oe.spdx30.RelationshipType.hasConcludedLicense,
+            oe.spdx30.RelationshipType.hasDeclaredLicense,
+        ):
+            return False
+        # Recipe SPDX attaches hasConcludedLicense to every source File as well.
+        # Only keep license edges from install packages.
+        fr = obj.from_
+        if isinstance(fr, (list, tuple)):
+            fr = fr[0] if fr else None
+        if isinstance(fr, oe.spdx30.software_Package):
+            return (
+                fr.software_primaryPurpose
+                == oe.spdx30.software_SoftwarePurpose.install
+            )
+        if isinstance(fr, str):
+            return "/package/" in fr
+        return False
+
+    if isinstance(
+        obj,
+        (
+            oe.spdx30.security_Vulnerability,
+            oe.spdx30.security_VexAffectedVulnAssessmentRelationship,
+            oe.spdx30.security_VexFixedVulnAssessmentRelationship,
+            oe.spdx30.security_VexNotAffectedVulnAssessmentRelationship,
+            oe.spdx30.security_VexUnderInvestigationVulnAssessmentRelationship,
+        ),
+    ):
+        return False
+
+    if isinstance(obj, oe.spdx30.software_Package):
+        return (
+            obj.software_primaryPurpose == oe.spdx30.software_SoftwarePurpose.install
+        )
+
+    # Avoid merging every recipe's SpdxDocument into the image SBOM
+    if isinstance(obj, oe.spdx30.SpdxDocument):
+        return False
+
+    return True
+
+
+def packages_licenses_json_keep(elem):
+    """
+    Pre-filter raw JSON-LD @graph entries before SHACL deserialize.
+
+    License IDs live in recipe SPDX docs that also contain tens of thousands of
+    software_File nodes. Deserializing those dominates packages-licenses expand
+    time; keep only objects the element filter can care about.
+    """
+    t = elem.get("type")
+    if t in (
+        "software_File",
+        "build_Build",
+        "LifecycleScopedRelationship",
+    ):
+        return False
+    if t and str(t).startswith("security_"):
+        return False
+    if t == "Relationship":
+        rt = elem.get("relationshipType")
+        if rt not in (
+            "hasConcludedLicense",
+            "hasDeclaredLicense",
+            "dependsOn",
+        ):
+            return False
+        fr = elem.get("from")
+        if isinstance(fr, str) and "/package/" not in fr:
+            return False
+        return True
+    if t == "software_Package":
+        return elem.get("software_primaryPurpose") == "install"
+    return True
+
+
+@contextmanager
+def _packages_licenses_jsonld_loader():
+    """
+    Temporarily make oe.sbom30.load_jsonld strip file inventories before decode.
+    Scoped to packages-licenses image SBOM so recipe SPDX tasks are unchanged.
+    """
+    orig_load = oe.sbom30.load_jsonld
+
+    def load_jsonld(d, path, required=False):
+        deserializer = oe.spdx30.JSONLDDeserializer()
+        objset = oe.sbom30.ObjectSet(d)
+        try:
+            with path.open("rb") as f:
+                data = json.load(f)
+        except FileNotFoundError:
+            if required:
+                bb.fatal("No SPDX document named %s found" % path)
+            return None
+
+        if isinstance(data, dict) and "@graph" in data:
+            data["@graph"] = [
+                e for e in data["@graph"] if packages_licenses_json_keep(e)
+            ]
+
+        deserializer.deserialize_data(data, objset)
+
+        if not objset.doc:
+            bb.fatal("SPDX Document %s has no SPDXDocument element" % path)
+            return None
+
+        objset.objects.remove(objset.doc)
+        return objset
+
+    oe.sbom30.load_jsonld = load_jsonld
+    try:
+        yield
+    finally:
+        oe.sbom30.load_jsonld = orig_load
+
+
+def create_image_sbom_packages_licenses(d):
+    """
+    Image SBOM with installed packages and their licenses only.
+
+    Avoids expanding rootfs file lists and recipe source-file inventories that
+    dominate Stinson/Hawaii SBOMs when SRC_URI uses file:// directories.
+    """
+    import oe.sbom30
+
+    image_name = d.getVar("IMAGE_NAME")
+    image_link_name = d.getVar("IMAGE_LINK_NAME")
+    imgdeploydir = Path(d.getVar("SPDXIMAGEDEPLOYDIR"))
+    root_packages_file = Path(d.getVar("SPDX_ROOTFS_PACKAGES"))
+
+    with root_packages_file.open("r") as f:
+        packages = json.load(f)
+
+    providers = oe.spdx_common.collect_package_providers(d)
+    root_elements = []
+    add_objectsets = []
+    missing_providers = set()
+
+    with _packages_licenses_jsonld_loader():
+        for name in sorted(packages.keys()):
+            if name not in providers:
+                missing_providers.add(name)
+                continue
+
+            pkg_name, _ = providers[name]
+            pkg_spdx, pkg_objset = oe.sbom30.find_root_obj_in_jsonld(
+                d,
+                "packages",
+                "package-" + pkg_name,
+                oe.spdx30.software_Package,
+                software_primaryPurpose=oe.spdx30.software_SoftwarePurpose.install,
+            )
+            add_objectsets.append(pkg_objset)
+            root_elements.append(oe.sbom30.get_element_link_id(pkg_spdx))
+
+        if missing_providers:
+            bb.fatal(
+                "Unable to find SPDX provider(s) for: %s"
+                % ", ".join(sorted(missing_providers))
+            )
+
+        if not root_elements:
+            bb.fatal("No installed packages found for packages-licenses image SBOM")
+
+        objset, sbom = oe.sbom30.create_sbom(
+            d,
+            image_name,
+            root_elements,
+            add_objectsets=add_objectsets,
+            element_filter=packages_licenses_element_filter,
+        )
+
+    spdx_path = imgdeploydir / (image_name + ".spdx.json")
+    oe.sbom30.write_jsonld_doc(d, objset, spdx_path)
+
+    def make_image_link(target_path, suffix):
+        if image_link_name:
+            link = imgdeploydir / (image_link_name + suffix)
+            if link != target_path:
+                link.symlink_to(os.path.relpath(target_path, link.parent))
+
+    make_image_link(spdx_path, ".spdx.json")
+    bb.note(
+        "Wrote packages-licenses image SBOM with %d packages (%s)"
+        % (len(root_elements), spdx_path)
+    )
+
+
 def create_image_sbom_spdx(d):
     import oe.sbom30
+
+    contents = d.getVar("SPDX_IMAGE_SBOM_CONTENTS") or "full"
+    if contents == "packages-licenses":
+        create_image_sbom_packages_licenses(d)
+        return
+    if contents != "full":
+        bb.fatal(
+            "SPDX_IMAGE_SBOM_CONTENTS must be 'full' or 'packages-licenses', got %r"
+            % contents
+        )
 
     image_name = d.getVar("IMAGE_NAME")
     image_basename = d.getVar("IMAGE_BASENAME")

@@ -78,6 +78,8 @@ do_create_image_sbom_spdx[stamp-extra-info] = "${MACHINE_ARCH}"
 do_create_image_sbom_spdx[cleandirs] = "${SPDXIMAGEDEPLOYDIR}"
 do_create_image_sbom_spdx[recrdeptask] += "do_create_spdx do_create_package_spdx"
 do_create_image_sbom_spdx[file-checksums] += "${SPDX3_LIB_DEP_FILES}"
+do_create_image_sbom_spdx[file-checksums] += "${COREBASE}/meta/lib/oe/spdx30_tasks.py:True"
+do_create_image_sbom_spdx[vardeps] += "SPDX_IMAGE_SBOM_CONTENTS"
 
 python do_create_image_sbom_spdx_setscene() {
     sstate_setscene(d)

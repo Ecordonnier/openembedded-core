@@ -32,6 +32,14 @@ SPDX_IMAGE_PURPOSE[doc] = "The list of purposes to assign to the generated image
     The first listed item will be the Primary Purpose and all additional items will \
     be added as additional purposes"
 
+SPDX_IMAGE_SBOM_CONTENTS ??= "full"
+SPDX_IMAGE_SBOM_CONTENTS[doc] = "Controls what is included in the image SBOM \
+    (do_create_image_sbom_spdx). Set to 'full' (default) for the complete build \
+    SBOM including rootfs files and recipe source inputs. Set to \
+    'packages-licenses' for a lean SBOM with installed packages and their \
+    concluded/declared licenses only (recommended for product/compliance \
+    publishing when copyleft sources are offered separately via the archiver)."
+
 SPDX_SDK_PURPOSE ?= "install"
 SPDX_SDK_PURPOSE[doc] = "The list of purposes to assign to the generate SDK installer. \
     The first listed item will be the Primary Purpose and all additional items will \
