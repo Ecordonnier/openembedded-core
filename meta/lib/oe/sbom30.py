@@ -806,9 +806,13 @@ class ObjectSet(oe.spdx30.SHACLObjectSet):
 
         return objset
 
-    def expand_collection(self, *, add_objectsets=[]):
+    def expand_collection(self, *, add_objectsets=[], element_filter=None):
         """
         Expands a collection to pull in all missing elements
+
+        If element_filter is set, it must be a callable that takes a SHACLObject
+        and returns True if the object should be merged into this set. Use this
+        to build lean SBOMs that omit files, build graphs, VEX, etc.
 
         Returns the set of ids that could not be found to link into the document
         """
@@ -822,38 +826,127 @@ class ObjectSet(oe.spdx30.SHACLObjectSet):
                 if not e.externalSpdxId in imports:
                     imports[e.externalSpdxId] = e
 
-            self.objects |= other.objects
+            if element_filter is None:
+                self.objects |= other.objects
+                return set(other.obj_by_id.keys())
+
+            added = set()
+            for obj in other.objects:
+                if not element_filter(obj):
+                    continue
+                self.objects.add(obj)
+                if obj._id:
+                    added.add(obj._id)
+                # CreationInfo and other non-Elements have no extension property
+                if isinstance(obj, oe.spdx30.Element):
+                    alias_ext = get_alias(obj)
+                    if alias_ext is not None and alias_ext.alias:
+                        added.add(alias_ext.alias)
+            return added
 
         for o in add_objectsets:
             merge_doc(o)
 
-        needed_spdxids = self.link()
-        provided_spdxids = set(self.obj_by_id.keys())
+        # Cache loaded SPDX docs by hash-path so the same recipe document is not
+        # deserialized once per license ID that lives in it.
+        spdxid_doc_cache = {}
+        merged_doc_paths = set()
 
-        while True:
-            import_spdxids = set(imports.keys())
-            searching_spdxids = (
-                needed_spdxids - provided_spdxids - missing_spdxids - import_spdxids
-            )
-            if not searching_spdxids:
-                break
-
-            spdxid = searching_spdxids.pop()
-            bb.debug(
-                1,
-                f"Searching for {spdxid}. Remaining: {len(searching_spdxids)}, Total: {len(provided_spdxids)}, Missing: {len(missing_spdxids)}, Imports: {len(import_spdxids)}",
-            )
-            dep_objset, dep_path = find_by_spdxid(self.d, spdxid)
-
-            if dep_objset:
-                dep_provided = set(dep_objset.obj_by_id.keys())
-                if spdxid not in dep_provided:
-                    bb.fatal(f"{spdxid} not found in {dep_path}")
-                provided_spdxids |= dep_provided
-                needed_spdxids |= dep_objset.missing_ids
-                merge_doc(dep_objset)
+        def find_cached(spdxid):
+            if spdxid.startswith(OE_ALIAS_PREFIX):
+                h = spdxid[len(OE_ALIAS_PREFIX) :].split("/", 1)[0]
+                key = jsonld_hash_path(h)
             else:
-                missing_spdxids.add(spdxid)
+                key = jsonld_hash_path(hash_id(spdxid))
+            cached = spdxid_doc_cache.get(key)
+            if cached is not None:
+                return cached
+            result = find_jsonld(self.d, *key, required=False)
+            spdxid_doc_cache[key] = result
+            return result
+
+        if element_filter is None:
+            # Original full-SBOM path: discover needs incrementally per ID.
+            needed_spdxids = self.link()
+            provided_spdxids = set(self.obj_by_id.keys())
+
+            while True:
+                import_spdxids = set(imports.keys())
+                searching_spdxids = (
+                    needed_spdxids - provided_spdxids - missing_spdxids - import_spdxids
+                )
+                if not searching_spdxids:
+                    break
+
+                spdxid = searching_spdxids.pop()
+                bb.debug(
+                    1,
+                    f"Searching for {spdxid}. Remaining: {len(searching_spdxids)}, Total: {len(provided_spdxids)}, Missing: {len(missing_spdxids)}, Imports: {len(import_spdxids)}",
+                )
+                dep_objset, dep_path = find_by_spdxid(self.d, spdxid)
+
+                if dep_objset:
+                    dep_provided = set(dep_objset.obj_by_id.keys())
+                    if spdxid not in dep_provided:
+                        bb.fatal(f"{spdxid} not found in {dep_path}")
+                    provided_spdxids |= dep_provided
+                    needed_spdxids |= dep_objset.missing_ids
+                    merge_doc(dep_objset)
+                else:
+                    missing_spdxids.add(spdxid)
+        else:
+            # Lean path: fetch all currently-needed IDs in a batch, then link()
+            # once per round. Avoids O(n_ids * n_objects) full re-links.
+            needed_spdxids = self.link()
+            provided_spdxids = set(self.obj_by_id.keys())
+            round_idx = 0
+
+            while True:
+                import_spdxids = set(imports.keys())
+                searching_spdxids = (
+                    needed_spdxids - provided_spdxids - missing_spdxids - import_spdxids
+                )
+                if not searching_spdxids:
+                    break
+
+                round_idx += 1
+                bb.note(
+                    "Expanding SPDX collection round %d: resolving %d ids "
+                    "(objects=%d, docs_cached=%d)"
+                    % (
+                        round_idx,
+                        len(searching_spdxids),
+                        len(provided_spdxids),
+                        len(spdxid_doc_cache),
+                    )
+                )
+
+                for spdxid in sorted(searching_spdxids):
+                    dep_objset, dep_path = find_cached(spdxid)
+                    if dep_objset is None:
+                        missing_spdxids.add(spdxid)
+                        continue
+
+                    dep_provided = set(dep_objset.obj_by_id.keys())
+                    if spdxid not in dep_provided:
+                        bb.fatal(f"{spdxid} not found in {dep_path}")
+
+                    dep_path_str = str(dep_path) if dep_path is not None else spdxid
+                    if dep_path_str in merged_doc_paths:
+                        # Filtered contents of this doc already merged; the ID
+                        # should already be present unless the filter dropped it.
+                        if spdxid not in provided_spdxids:
+                            missing_spdxids.add(spdxid)
+                        continue
+
+                    added = merge_doc(dep_objset)
+                    merged_doc_paths.add(dep_path_str)
+                    provided_spdxids |= added
+                    if spdxid not in provided_spdxids and spdxid not in added:
+                        missing_spdxids.add(spdxid)
+
+                needed_spdxids = self.link()
+                provided_spdxids = set(self.obj_by_id.keys())
 
         self.doc.import_ = sorted(imports.values(), key=lambda e: e.externalSpdxId)
         bb.debug(1, "Linking...")
@@ -1032,7 +1125,7 @@ def find_by_spdxid(d, spdxid, *, required=False):
     return find_jsonld(d, *jsonld_hash_path(hash_id(spdxid)), required=required)
 
 
-def create_sbom(d, name, root_elements, add_objectsets=[]):
+def create_sbom(d, name, root_elements, add_objectsets=[], *, element_filter=None):
     objset = ObjectSet.new_objset(d, name)
 
     sbom = objset.add(
@@ -1045,7 +1138,9 @@ def create_sbom(d, name, root_elements, add_objectsets=[]):
         )
     )
 
-    missing_spdxids = objset.expand_collection(add_objectsets=add_objectsets)
+    missing_spdxids = objset.expand_collection(
+        add_objectsets=add_objectsets, element_filter=element_filter
+    )
     if missing_spdxids:
         bb.warn(
             "The following SPDX IDs were unable to be resolved:\n  "
@@ -1058,21 +1153,19 @@ def create_sbom(d, name, root_elements, add_objectsets=[]):
     # SBoM should be the only root element of the document
     objset.doc.rootElement = [sbom]
 
-    # De-duplicate licenses
-    unique = set()
+    # De-duplicate licenses (O(n) by expression + list version)
     dedup = {}
+    unique_by_key = {}
     for lic in objset.foreach_type(oe.spdx30.simplelicensing_LicenseExpression):
-        for u in unique:
-            if (
-                u.simplelicensing_licenseExpression
-                == lic.simplelicensing_licenseExpression
-                and u.simplelicensing_licenseListVersion
-                == lic.simplelicensing_licenseListVersion
-            ):
-                dedup[lic] = u
-                break
+        key = (
+            lic.simplelicensing_licenseExpression,
+            lic.simplelicensing_licenseListVersion,
+        )
+        canonical = unique_by_key.get(key)
+        if canonical is None:
+            unique_by_key[key] = lic
         else:
-            unique.add(lic)
+            dedup[lic] = canonical
 
     if dedup:
         for rel in objset.foreach_filter(
@@ -1087,8 +1180,16 @@ def create_sbom(d, name, root_elements, add_objectsets=[]):
         ):
             rel.to = [dedup.get(to, to) for to in rel.to]
 
+        bb.debug(
+            1,
+            "Removing %d duplicate LicenseExpression objects"
+            % len(dedup),
+        )
         for k, v in dedup.items():
-            bb.debug(1, f"Removing duplicate License {k._id} -> {v._id}")
+            bb.debug(
+                2,
+                "Removing duplicate License %s -> %s" % (k._id, v._id),
+            )
             objset.objects.remove(k)
 
         objset.create_index()
