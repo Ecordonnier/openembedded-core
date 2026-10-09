@@ -38,6 +38,9 @@ VIRTUAL-RUNTIME_libsdl2 ?= "libsdl2"
 #
 # Default recipe providers
 #
+PREFERRED_PROVIDER_coreutils ?= "coreutils"
+PREFERRED_PROVIDER_coreutils-native ?= "coreutils-native"
+PREFERRED_PROVIDER_nativesdk-coreutils ?= "nativesdk-coreutils"
 PREFERRED_PROVIDER_dbus-glib ?= "dbus-glib"
 PREFERRED_PROVIDER_dbus-glib-native ?= "dbus-glib-native"
 PREFERRED_PROVIDER_gdk-pixbuf ?= "gdk-pixbuf"
