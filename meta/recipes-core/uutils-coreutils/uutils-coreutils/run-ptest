@@ -1,0 +1,19 @@
+#!/bin/sh
+
+# The tests expect to run as a regular user, e.g. they check for permission
+# denied errors which root does not get, so re-run this script as one.
+# The generated test runner lines appended below run in this same script.
+if [ "$(id -u)" = 0 ]; then
+    SELF=$(readlink -f "$0")
+    USERNAME="tester"
+    groupadd ugroup1 2>/dev/null
+    groupadd ugroup2 2>/dev/null
+    id $USERNAME >/dev/null 2>&1 || useradd -G ugroup1,ugroup2 $USERNAME
+    su $USERNAME -c "$SELF"
+    exit $?
+fi
+
+# The tests look for their fixtures in tests/fixtures relative to the current
+# directory and run the multicall binary given by UUTESTS_BINARY_PATH
+cd $(dirname $0)
+export UUTESTS_BINARY_PATH=/usr/bin/coreutils

@@ -155,6 +155,7 @@ PTESTS_SLOW = "\
     tcl \
     tcl8 \
     util-linux \
+    uutils-coreutils \
     zstd \
 "
 
