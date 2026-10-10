@@ -5,8 +5,11 @@
 # The intent is to allow some images/configurations to build, not everything. There
 # will be a cost in reduced functionality.
 
+# Use the MIT licensed uutils-coreutils instead of GNU coreutils
+PREFERRED_PROVIDER_coreutils = "uutils-coreutils"
+
 # Settings for full-cmdline
-RDEPENDS:packagegroup-core-full-cmdline-utils:remove = "bash bc coreutils cpio ed findutils gawk grep mc mc-shell mc-helpers mc-helpers-perl sed tar time"
+RDEPENDS:packagegroup-core-full-cmdline-utils:remove = "bash bc cpio ed findutils gawk grep mc mc-shell mc-helpers mc-helpers-perl sed tar time"
 RDEPENDS:packagegroup-core-full-cmdline-dev-utils:remove = "diffutils m4 make patch"
 RDEPENDS:packagegroup-core-full-cmdline-multiuser:remove = "gzip"
 
